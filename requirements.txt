@@ -1,0 +1,4 @@
+﻿flask
+gunicorn
+httpx
+line-bot-sdk
