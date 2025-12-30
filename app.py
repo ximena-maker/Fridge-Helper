@@ -929,11 +929,12 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
     header = TextSendMessage(
         text=(
             f"《{recipe_name}》步驟示意圖（一次輸出全部）\n"
-            f"（本次顯示 {shown} 步；上限 MAX_STEP_IMAGES={MAX_STEP_IMAGES}；每則最多 {FLEX_CAROUSEL_MAX_BUBBLES} 張圖）\n"
+            f"（本次顯示 {shown} 步）\n"
             "不喜歡可按『換食譜』換一批。"
         ),
         quick_reply=make_quickreply_menu(),
     )
+
 
     safe_reply(reply_token, [header] + flex_msgs)
 
