@@ -106,7 +106,7 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 MAX_KEEP_IMAGES = int(os.getenv("MAX_KEEP_IMAGES", "200"))
 
 # 做法圖一次最多生成幾步（避免 Flex bubble 過多）
-MAX_STEP_IMAGES = int(os.getenv("MAX_STEP_IMAGES", "12"))
+MAX_STEP_IMAGES = int(os.getenv("MAX_STEP_IMAGES", "30"))
 
 
 # ---------------------
