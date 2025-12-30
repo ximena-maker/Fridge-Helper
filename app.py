@@ -33,12 +33,13 @@ from google.genai import types
 # ✅ 不喜歡：輸入/按「換食譜」 -> 同一批食材換一批，並盡量避開上一輪菜名
 # ✅ 每道菜：有一張示意圖（Imagen 生成）
 # ✅ 做法 N：顯示「每一步的示意圖 + 步驟文字」（Imagen 生成），支援「上一頁/下一頁」
+# ✅ 新增：輸入「+」或「開啟按鈕選單」會跳出 Quick Reply 按鈕選單
 #
 # 必要環境變數（Render / 本機）：
 # - CHANNEL_SECRET
 # - CHANNEL_ACCESS_TOKEN
 # - GEMINI_API_KEY   (⚠️ 不能用被標記 leaked 的 key)
-# - PUBLIC_BASE_URL  例：https://fridge-helper.onrender.com   （步驟圖/料理圖要能被 LINE 以 https 讀取）
+# - PUBLIC_BASE_URL  例：https://fridge-helper.onrender.com
 #
 # 可選環境變數：
 # - GEMINI_TEXT_MODEL   預設 gemini-2.5-flash
@@ -175,7 +176,6 @@ def save_image_and_get_url(img_bytes: bytes) -> Optional[str]:
         f.write(img_bytes)
 
     if not PUBLIC_BASE_URL.startswith("https://"):
-        # 沒設定 PUBLIC_BASE_URL 或不是 https -> LINE 會顯示不了圖
         return None
 
     return f"{PUBLIC_BASE_URL}/static/generated/{fname}"
@@ -326,7 +326,6 @@ def gemini_generate_recipes(
     data.setdefault("ingredients", [])
     data.setdefault("recipes", [])
 
-    # 防呆：保證至少 n_recipes
     recipes = data.get("recipes") or []
     if not isinstance(recipes, list):
         recipes = []
@@ -348,10 +347,11 @@ def gemini_generate_recipes(
         d2 = _safe_json_loads(getattr(resp2, "text", "") or "")
         r2 = (d2.get("recipes") or []) if isinstance(d2, dict) else []
         if isinstance(r2, list):
-            # 合併去重（以 name）
             seen = {(_norm_token(r.get("name", ""))) for r in recipes}
             for r in r2:
-                nm = _norm_token((r or {}).get("name", ""))
+                if not isinstance(r, dict):
+                    continue
+                nm = _norm_token(r.get("name", ""))
                 if nm and nm not in seen:
                     recipes.append(r)
                     seen.add(nm)
@@ -566,7 +566,6 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
         if not isinstance(recipes, list) or len(recipes) < 3:
             raise RuntimeError("Gemini 沒產出足夠的食譜（少於 3 道）")
 
-        # 料理圖片：每道 1 張
         bubbles = []
         titles = []
         final_recipes = []
@@ -577,7 +576,6 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
             name = r.get("name", f"料理 {i}")
             titles.append(name)
 
-            # Imagen 成品圖 prompt（英文）
             img_prompt = (r.get("image_prompt") or "").strip()
             if not img_prompt:
                 img_prompt = f"A high-quality photorealistic food photo of {name}, plated nicely, natural lighting, shallow depth of field, no text"
@@ -606,7 +604,8 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
                 f"{fridge_text(user_id)}\n\n"
                 "我給你 3 個選項～\n"
                 "📌 看做法（含步驟圖）：輸入『做法 1/2/3』\n"
-                "🔁 不喜歡：輸入/按『換食譜』再換一批"
+                "🔁 不喜歡：輸入/按『換食譜』再換一批\n"
+                "💡 想叫出按鈕選單：輸入『+』或『開啟按鈕選單』"
             ),
             quick_reply=make_quickreply_menu(),
         )
@@ -702,7 +701,6 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
 
         url = None
         try:
-            # 如果 prompt 空，就給一個保底
             if not p:
                 p = f"Photorealistic instructional cooking image showing step in action for {recipe_name}, hands, utensils, ingredients, kitchen, natural lighting, no text"
             url = generate_image_url(p)
@@ -790,7 +788,8 @@ def handle_follow(event: FollowEvent):
         "✅ 或輸入『加入 雞肉』把食材存進冰箱\n"
         "✅ 輸入『推薦』用冰箱食材生成 3 道菜\n"
         "✅ 不喜歡按『換食譜』再換一批\n"
-        "✅ 看做法（含步驟圖）：輸入『做法 1』"
+        "✅ 看做法（含步驟圖）：輸入『做法 1』\n"
+        "✅ 叫出按鈕選單：輸入『+』或『開啟按鈕選單』"
     )
     line_api.reply_message(
         event.reply_token,
@@ -802,6 +801,17 @@ def handle_follow(event: FollowEvent):
 def handle_text(event: MessageEvent):
     user_id = event.source.user_id
     text = (event.message.text or "").strip()
+
+    # ---------- 開啟按鈕選單 ----------
+    if text in {"+", "開啟按鈕選單", "按鈕選單", "選單", "menu", "MENU"}:
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="這是按鈕選單～你可以點選快速加入食材或操作功能 👇",
+                quick_reply=make_quickreply_menu(),
+            ),
+        )
+        return
 
     # ---------- 翻頁 ----------
     if text in {"下一頁", "下一", "next"}:
