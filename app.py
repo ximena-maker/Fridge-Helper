@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 import json
@@ -39,7 +40,7 @@ from google.genai import types
 # 必要環境變數（Render / 本機）：
 # - CHANNEL_SECRET
 # - CHANNEL_ACCESS_TOKEN
-# - GEMINI_API_KEY
+# - GEMINI_API_KEY   (或 GOOGLE_API_KEY)
 # - PUBLIC_BASE_URL  例：https://fridge-helper.onrender.com  （必須 https，LINE 才顯示圖）
 #
 # requirements.txt 至少：
@@ -63,7 +64,7 @@ def load_line_keys(filepath: str = "keys.txt") -> Dict[str, str]:
     if not p.exists():
         raise RuntimeError("缺少 LINE CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN（請設定環境變數或提供 keys.txt）")
 
-    keys = {}
+    keys: Dict[str, str] = {}
     with p.open("r", encoding="utf-8") as f:
         for line in f:
             if "=" in line:
@@ -114,9 +115,9 @@ def cleanup_old_images():
         for p in files[MAX_KEEP_IMAGES:]:
             try:
                 p.unlink()
-            except:
+            except Exception:
                 pass
-    except:
+    except Exception:
         pass
 
 
@@ -165,6 +166,7 @@ def save_image_and_get_url(img_bytes: bytes) -> Optional[str]:
     with fpath.open("wb") as f:
         f.write(img_bytes)
 
+    # LINE 要顯示圖片必須是 https 的公開網址
     if not PUBLIC_BASE_URL.startswith("https://"):
         return None
     return f"{PUBLIC_BASE_URL}/static/generated/{fname}"
@@ -196,10 +198,10 @@ def generate_image_url(prompt: str) -> Optional[str]:
 # =========================================================
 # 冰箱：用「normalized -> 顯示字串」保留你輸入的原樣（部位也保留）
 user_fridge_map = defaultdict(dict)  # user_id -> {norm: display}
-recent_recipes = {}                  # user_id -> list[recipe dict] (至少 3)
-last_used_ings = {}                  # user_id -> list[str]  上次用的食材（顯示字串）
-last_titles = defaultdict(list)      # user_id -> list[str]  上次菜名（避開）
-step_view_state = {}                 # user_id -> {recipe_idx, recipe_name, steps, img_urls, page}
+recent_recipes: Dict[str, List[Dict[str, Any]]] = {}     # user_id -> list[recipe dict] (至少 3)
+last_used_ings: Dict[str, List[str]] = {}                # user_id -> list[str]  上次用的食材（顯示字串）
+last_titles = defaultdict(list)                          # user_id -> list[str]  上次菜名（避開）
+step_view_state: Dict[str, Dict[str, Any]] = {}          # user_id -> {recipe_idx, recipe_name, steps, img_urls, page}
 
 
 def fridge_list(user_id: str) -> List[str]:
@@ -213,7 +215,7 @@ def fridge_text(user_id: str) -> str:
 
 def add_to_fridge(user_id: str, items: List[str]) -> List[str]:
     """回傳實際新增的（顯示字串）"""
-    added = []
+    added: List[str] = []
     for x in items:
         x = (x or "").strip()
         if not x:
@@ -236,7 +238,7 @@ def remove_from_fridge(user_id: str, items: List[str]) -> List[str]:
     從冰箱移除 items（支援模糊：牛小排 可以移除 霜降牛小排）
     回傳實際移除到的（顯示字串）
     """
-    removed = []
+    removed: List[str] = []
     if not items:
         return removed
 
@@ -245,7 +247,6 @@ def remove_from_fridge(user_id: str, items: List[str]) -> List[str]:
     if not targets:
         return removed
 
-    # 需要遍歷 keys，避免邊刪邊迭代出錯
     keys = list(user_fridge_map[user_id].keys())
     for k in keys:
         disp = user_fridge_map[user_id].get(k, "")
@@ -264,6 +265,7 @@ def remove_from_fridge(user_id: str, items: List[str]) -> List[str]:
 # =========================================================
 SEPS = r"[\s、,，;；/｜|]+"
 
+
 def heuristic_extract_ingredients(text: str) -> List[str]:
     """
     保底抽取（不限制輸入）：偵測「我家有/冰箱有/剩下/有」後面的字串，或直接整句拆詞。
@@ -273,7 +275,6 @@ def heuristic_extract_ingredients(text: str) -> List[str]:
     if not t:
         return []
 
-    # 優先取「我家有...」後面
     m = re.search(r"(我家有|冰箱裡有|冰箱有|我剩下|剩下|有)\s*(.*)$", t)
     if m:
         tail = (m.group(2) or "").strip()
@@ -281,9 +282,7 @@ def heuristic_extract_ingredients(text: str) -> List[str]:
             parts = [p.strip() for p in re.split(SEPS, tail) if p.strip()]
             return parts
 
-    # 沒有關鍵字：就整句拆（可能會混到其他字，但至少能吃到你用分隔符列的食材）
     parts = [p.strip() for p in re.split(SEPS, t) if p.strip()]
-    # 過濾掉太短且常見語助詞
     bad = {"我", "家", "有", "冰箱", "剩下", "想", "煮", "做", "可以", "幫我", "一下"}
     parts = [p for p in parts if p not in bad]
     return parts
@@ -294,9 +293,9 @@ def heuristic_extract_ingredients(text: str) -> List[str]:
 # =========================================================
 COMMON_INGS = ["雞肉", "牛肉", "豬肉", "雞蛋", "洋蔥", "大蒜", "蔥"]  # 只做快捷，不限制輸入
 
+
 def make_quickreply_menu() -> QuickReply:
     items = []
-    # 6 個食材 + 7 個功能 = 13（LINE quick reply 有上限）
     for ing in COMMON_INGS[:6]:
         items.append(QuickReplyButton(action=MessageAction(label=f"+{ing}", text=f"加入 {ing}")))
 
@@ -476,7 +475,7 @@ def gemini_steps_with_prompts(recipe_name: str, steps: List[str]) -> List[Dict[s
     if not isinstance(data, dict) or "steps" not in data or not isinstance(data["steps"], list):
         raise RuntimeError("Gemini 無法產生步驟 prompts JSON")
 
-    out = []
+    out: List[Dict[str, str]] = []
     for s in data["steps"]:
         if not isinstance(s, dict):
             continue
@@ -617,7 +616,7 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
         if extracted:
             add_to_fridge(user_id, extracted)
         else:
-            # 如果 Gemini 沒回 ingredients，就用保底拆詞把「疑似食材」加進去（不限制任何字）
+            # 如果 Gemini 沒回 ingredients，就用保底拆詞把「疑似食材」加進去
             fallback = heuristic_extract_ingredients(user_text)
             if fallback:
                 add_to_fridge(user_id, fallback)
@@ -631,7 +630,7 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
 
         bubbles = []
         titles = []
-        final_recipes = []
+        final_recipes: List[Dict[str, Any]] = []
 
         for i, r in enumerate(recipes[:3], start=1):
             if not isinstance(r, dict):
@@ -646,7 +645,7 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
             dish_img_url = None
             try:
                 dish_img_url = generate_image_url(img_prompt)
-            except:
+            except Exception:
                 dish_img_url = None
 
             bubbles.append(recipe_to_bubble(i, r, dish_img_url))
@@ -762,7 +761,7 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
             if not p:
                 p = f"Photorealistic instructional cooking image showing a step in action for {recipe_name}, hands, utensils, ingredients, kitchen, natural lighting, no text"
             url = generate_image_url(p)
-        except:
+        except Exception:
             url = None
         img_urls.append(url)
 
@@ -808,7 +807,7 @@ def reply_step_page(user_id: str, reply_token: str, delta: int):
     page_size = 5
     max_page = max(0, (total - 1) // page_size)
 
-    new_page = cache.get("page", 0) + delta
+    new_page = int(cache.get("page", 0)) + int(delta)
     new_page = max(0, min(new_page, max_page))
     cache["page"] = new_page
 
@@ -824,6 +823,16 @@ def reply_step_page(user_id: str, reply_token: str, delta: int):
 # Flask
 # =========================================================
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+
+@app.get("/")
+def index():
+    return "OK"
+
+
+@app.get("/healthz")
+def healthz():
+    return "healthy"
 
 
 @app.route("/callback", methods=["POST"])
@@ -862,7 +871,10 @@ def handle_text(event: MessageEvent):
     if text in {"+", "開啟按鈕選單", "按鈕選單", "選單", "menu", "MENU"}:
         line_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="這是按鈕選單～你可以快速加入/推薦/換食譜/移除食材 👇", quick_reply=make_quickreply_menu()),
+            TextSendMessage(
+                text="這是按鈕選單～你可以快速加入/推薦/換食譜/移除食材 👇",
+                quick_reply=make_quickreply_menu(),
+            ),
         )
         return
 
@@ -890,7 +902,10 @@ def handle_text(event: MessageEvent):
         if not parts:
             line_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text="請輸入：- 雞腿排 洋蔥（可一次移除多個）", quick_reply=make_remove_quickreply(user_id)),
+                TextSendMessage(
+                    text="請輸入：- 雞腿排 洋蔥（可一次移除多個）",
+                    quick_reply=make_remove_quickreply(user_id),
+                ),
             )
             return
         removed = remove_from_fridge(user_id, parts)
@@ -915,8 +930,59 @@ def handle_text(event: MessageEvent):
         reply_step_page(user_id, event.reply_token, delta=-1)
         return
 
-    # ---------- 查看/清空 ----------
+    # ---------- 查看冰箱 ----------
     if text in {"查看冰箱", "冰箱", "我的冰箱"}:
         line_api.reply_message(event.reply_token, TextSendMessage(text=fridge_text(user_id), quick_reply=make_quickreply_menu()))
         return
-    if text in {"清空冰箱", "清空
+
+    # ---------- 清空冰箱（✅修掉你原本換行造成的 SyntaxError） ----------
+    if text in {"清空冰箱", "清空", "重置冰箱", "清空全部"}:
+        clear_fridge(user_id)
+        recent_recipes.pop(user_id, None)
+        last_used_ings.pop(user_id, None)
+        last_titles.pop(user_id, None)
+        step_view_state.pop(user_id, None)
+
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="🗑 已清空冰箱！\n你的冰箱目前：（空的）", quick_reply=make_quickreply_menu()),
+        )
+        return
+
+    # ---------- 加入食材：支援「加入 xxx」或「加 xxx」 ----------
+    m_add = re.match(r"^(加入|加)\s*(.+)$", text)
+    if m_add:
+        raw = (m_add.group(2) or "").strip()
+        parts = [p.strip() for p in re.split(SEPS, raw) if p.strip()]
+        if not parts:
+            line_api.reply_message(event.reply_token, TextSendMessage(text="請輸入：加入 雞腿排 洋蔥", quick_reply=make_quickreply_menu()))
+            return
+        added = add_to_fridge(user_id, parts)
+        msg = f"✅ 已加入：{'、'.join(added)}\n{fridge_text(user_id)}" if added else f"這些已經在冰箱裡了～\n{fridge_text(user_id)}"
+        line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=make_quickreply_menu()))
+        return
+
+    # ---------- 做法 N ----------
+    m_steps = re.match(r"^(做法)\s*(\d+)\s*$", text)
+    if m_steps:
+        idx = int(m_steps.group(2)) - 1
+        reply_steps_with_images(user_id, event.reply_token, recipe_idx=idx)
+        return
+
+    # ---------- 換食譜 / 推薦 ----------
+    if text in {"換食譜", "換", "重新推薦", "再推薦"}:
+        reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=True)
+        return
+
+    if text in {"推薦", "給我食譜", "食譜", "煮什麼", "今天煮什麼"}:
+        reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=False)
+        return
+
+    # ---------- 其他任何輸入：一律當作「你想用這句話來推薦」 ----------
+    reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=False)
+
+
+if __name__ == "__main__":
+    # Render 用 gunicorn 啟動時不會跑到這裡；本機測試才會用到
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
