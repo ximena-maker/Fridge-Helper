@@ -2,18 +2,15 @@ import os
 import json
 import re
 from collections import defaultdict
-from typing import List, Dict, Any
+from pathlib import Path
 
-import httpx
 from flask import Flask, request, abort
-
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     TextSendMessage,
     MessageEvent,
     TextMessage,
-    
     FollowEvent,
     FlexSendMessage,
     QuickReply,
@@ -22,442 +19,521 @@ from linebot.models import (
 )
 
 # =========================================================
-# 1) 設定：LINE Keys / Gemini Keys
+#  冰箱清理小幫手（LINE Bot）
+#  功能：
+#   1) 句子/字串輸入："我家有 牛胸肉 雞肉 洋蔥 花椰菜" -> 自動抓食材 + 推薦
+#   2) 按鈕選食材：快速加入常見食材、查看冰箱、清空、用現有冰箱推薦
+#  說明：
+#   - 你目前專案沒有 bert-ingredient-ner 模型資料夾
+#   - 所以這版「不使用 transformers / NER 模型」
+#   - 改用：從 aaaaicook_data.json 產生食材字典 + split/包含匹配抽取食材
 # =========================================================
 
-def load_line_keys(filename="keys.txt"):
+# ---------------------
+# LINE channel keys
+# ---------------------
+def load_line_keys(filepath: str = "keys.txt"):
+    """
+    讀取 LINE 金鑰：
+    1) 優先讀環境變數 CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN
+    2) 其次讀與 app.py 同層的 keys.txt（或你指定的 filepath）
+    """
+    channel_secret = os.getenv("CHANNEL_SECRET")
+    channel_access_token = os.getenv("CHANNEL_ACCESS_TOKEN")
+    if channel_secret and channel_access_token:
+        return {
+            "CHANNEL_SECRET": channel_secret,
+            "CHANNEL_ACCESS_TOKEN": channel_access_token,
+        }
+
+    p = Path(__file__).with_name(filepath)
+    if not p.exists():
+        raise RuntimeError(
+            "錯誤：缺少 LINE CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN（請設定環境變數或提供 keys.txt）"
+        )
+
     keys = {}
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                keys[k.strip()] = v.strip()
 
-    # 永遠讀 app.py 同層的 keys.txt（避免 cwd 問題）
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    filepath = os.path.join(base_dir, filename)
-
-    if os.path.exists(filepath):
-        # utf-8-sig 會自動吃掉 BOM
-        with open(filepath, "r", encoding="utf-8-sig") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    k = k.strip().lstrip("\ufeff")  # 保險：再手動去一次 BOM
-                    keys[k] = v.strip()
+    if "CHANNEL_SECRET" not in keys or "CHANNEL_ACCESS_TOKEN" not in keys:
+        raise RuntimeError("keys.txt 內容不完整：需要 CHANNEL_SECRET 與 CHANNEL_ACCESS_TOKEN")
 
     return keys
 
 
+line_keys = load_line_keys()
+channel_secret = line_keys["CHANNEL_SECRET"]
+channel_access_token = line_keys["CHANNEL_ACCESS_TOKEN"]
+line_api = LineBotApi(channel_access_token)
+handler = WebhookHandler(channel_secret)
 
-file_keys = load_line_keys()
+# ---------------------
+# 食譜資料
+# ---------------------
+with open("aaaaicook_data.json", encoding="utf-8") as f:
+    recipes = json.load(f)
 
-CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET") or file_keys.get("CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN") or file_keys.get("CHANNEL_ACCESS_TOKEN", "")
-
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise RuntimeError("缺少 LINE CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN（請設定環境變數或 keys.txt）")
-
-line_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
-print("TOKEN length:", len(CHANNEL_ACCESS_TOKEN), "SECRET length:", len(CHANNEL_SECRET))
-
-# Gemini
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or file_keys.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # 你也可以改成其他可用 model
+量詞 = r"(?:顆|條|片|絲|克|g|kg|匙|茶?匙|大?匙|杯|罐|包|塊|少許|適量|些許)"
 
 
-# =========================================================
-# 2) 狀態：使用者選的食材 / 料理結果 / quick reply 頁數
-# =========================================================
+def norm(word: str) -> str:
+    word = re.sub(量詞, "", word, flags=re.I)
+    word = re.sub(r"\s+", "", word)
+    return word.lower().replace("　", "")
 
-user_selected = defaultdict(set)          # user_id -> set(食材)
-user_last_recipes: Dict[str, List[Dict[str, Any]]] = {}   # user_id -> Gemini 回傳的 recipes
-user_page = defaultdict(int)             # user_id -> quick reply page index
 
-# QuickReply 食材清單（你可以自由擴充）
+for r in recipes:
+    r["norm_ings"] = {norm(i.split()[0]) for i in r.get("ingredients", []) if i}
+
+inv_index = defaultdict(set)
+for idx, r in enumerate(recipes):
+    for ing in r["norm_ings"]:
+        inv_index[ing].add(idx)
+
+# ---------------------
+# 抽取食材（不靠模型：字典 + split/包含匹配）
+# ---------------------
+# Quick Reply 常見食材（也會加入抽取字典）
 COMMON_INGS = [
-    "雞蛋", "牛奶", "吐司", "起司", "奶油", "優格",
-    "番茄", "洋蔥", "蒜頭", "青蔥", "薑", "辣椒",
-    "高麗菜", "小黃瓜", "紅蘿蔔", "馬鈴薯", "玉米", "花椰菜",
-    "豆腐", "豆干", "金針菇", "香菇", "鴻喜菇", "杏鮑菇",
-    "雞胸", "雞腿", "豬肉", "牛肉", "絞肉", "培根",
-    "鮭魚", "鯖魚", "蝦仁", "花枝", "蛤蜊",
-    "白飯", "麵條", "冬粉", "烏龍麵",
-    "醬油", "鹽", "胡椒", "味噌", "番茄醬", "咖哩塊",
+    "雞肉",
+    "牛肉",
+    "牛胸肉",
+    "豬肉",
+    "雞蛋",
+    "洋蔥",
+    "大蒜",
+    "蔥",
+    "花椰菜",
+    "馬鈴薯",
+    "番茄",
+    "高麗菜",
+    "豆腐",
 ]
 
-PAGE_SIZE = 8
+# 同義詞/別名（可自行擴充）
+ALIASES = {
+    "牛胸肉": ["牛肉"],
+    "青花菜": ["花椰菜"],
+    "西蘭花": ["花椰菜"],
+    "蔥花": ["蔥"],
+}
 
 
-# =========================================================
-# 3) Gemini 呼叫：REST generateContent（JSON 回傳）
-# =========================================================
+def build_ingredient_vocab(recipes_list):
+    vocab = set()
 
-def _extract_json(text: str) -> str:
+    # 從食譜 ingredients 抽詞
+    for rec in recipes_list:
+        for raw in rec.get("ingredients", []):
+            base = raw.split()[0].strip()
+            if base:
+                vocab.add(norm(base))
+
+    # 加上常用按鈕食材
+    for x in COMMON_INGS:
+        vocab.add(norm(x))
+
+    # 加上同義詞
+    for k, arr in ALIASES.items():
+        vocab.add(norm(k))
+        for a in arr:
+            vocab.add(norm(a))
+
+    # 長詞優先，避免「牛肉」先吃掉「牛胸肉」
+    vocab = [v for v in vocab if v]
+    vocab.sort(key=len, reverse=True)
+    return vocab
+
+
+ING_VOCAB = build_ingredient_vocab(recipes)
+
+
+def fallback_split(text: str):
     """
-    保險用：如果模型沒乾淨輸出 JSON，嘗試抓第一段 [ ... ] 或 { ... }
+    更強的 split：
+    - 支援「我家有:雞肉、洋蔥」「我家有 雞肉」「冰箱有 雞肉/洋蔥」等
+    - 清除前綴語氣詞 + 各種標點符號（全形/半形）
     """
-    text = text.strip()
-    # 優先抓 list JSON
-    m = re.search(r"(\[\s*{.*}\s*\])", text, re.DOTALL)
-    if m:
-        return m.group(1)
-    # 再抓 object JSON
-    m = re.search(r"(\{\s*\".*\}\s*)", text, re.DOTALL)
-    if m:
-        return m.group(1)
-    return text
+    t = (text or "").strip()
+
+    # 清掉常見前綴（含冒號/空白）
+    t = re.sub(r"^(我家有|冰箱裡有|冰箱有|我剩下|剩下|有)\s*[:：]?\s*", "", t)
+
+    # 把常見標點都當成分隔符
+    # （含全形空白　、冒號：、句號。、驚嘆號！、問號？、括號等）
+    t = re.sub(r"[，,、;；/\\|｜\n\r\t:：。\.！!？?\(\)（）\[\]【】{}「」\"“”'’]", " ", t)
+
+    # 多個空白合併
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if not t:
+        return set()
+
+    parts = t.split(" ")
+    return {norm(p) for p in parts if p and norm(p)}
 
 
-def gemini_recipe_search(selected_ings: List[str], topk: int = 5) -> List[Dict[str, Any]]:
+def extract_ingredients(text: str):
     """
-    用 Gemini 依食材生成 topk 道食譜（回傳 list[dict]）
+    回傳 (entities_list, ingredient_set)
+    1) 先用 split 抽詞（最符合你「我家有 ...」的輸入）
+    2) 再用 ING_VOCAB 在整句做包含匹配（長詞優先）
     """
-    if not GEMINI_API_KEY:
-        raise RuntimeError("缺少 GEMINI_API_KEY（請設定環境變數）")
+    found = set()
 
-    prompt = f"""
-你是料理助理。使用者手上有這些食材：{", ".join(selected_ings)}。
-請推薦 {topk} 道「盡量用到上述食材」的家常料理。
+    # 1) split
+    found |= {x for x in fallback_split(text) if x}
 
-請只輸出 JSON（不要多任何文字），格式如下：
-[
-  {{
-    "name": "料理名",
-    "time_min": 20,
-    "ingredients": ["雞蛋 2顆", "番茄 1顆", "..."],
-    "steps": ["步驟1...", "步驟2..."],
-    "tips": "可選，1句小提醒"
-  }}
-]
-要求：
-- steps 要具體可操作
-- ingredients 請用「食材 + 大概份量」表示
-- 不要輸出網址
-""".strip()
+    # 2) 包含匹配（去空白）
+    t = re.sub(r"\s+", "", text or "")
+    t_norm = norm(t)
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.6
-        }
-    }
+    for ing in ING_VOCAB:
+        if ing and ing in t_norm:
+            found.add(ing)
 
-    r = httpx.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
+    # 3) 同義詞規整
+    for main, arr in ALIASES.items():
+        main_n = norm(main)
+        for a in arr:
+            if norm(a) in found:
+                found.add(main_n)
 
-    data = r.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    text = _extract_json(text)
-
-    recipes = json.loads(text)
-    if not isinstance(recipes, list):
-        raise RuntimeError("Gemini 回傳格式不是 list JSON")
-    return recipes[:topk]
+    found = {x for x in found if x and x not in {"。", "，", ",", "、"}}
+    return [], found
 
 
-# =========================================================
-# 4) LINE UI：QuickReply（按鈕選食材）、Flex（顯示推薦）
-# =========================================================
-
-def build_ing_quick_reply(user_id: str) -> QuickReply:
-    """
-    12 個食材 + 控制按鈕（更多/完成/清空/已選）
-    """
-    page = user_page[user_id]
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    chunk = COMMON_INGS[start:end]
-
-    # 如果超出範圍，回到第一頁
-    if not chunk:
-        user_page[user_id] = 0
-        start = 0
-        end = PAGE_SIZE
-        chunk = COMMON_INGS[start:end]
-
-    items = []
-    for ing in chunk:
-        items.append(
-            QuickReplyButton(action=MessageAction(label=ing, text=f"+{ing}"))
-        )
-
-    items.extend([
-        QuickReplyButton(action=MessageAction(label="➕更多", text="更多")),
-        QuickReplyButton(action=MessageAction(label="✅完成查食譜", text="完成")),
-        QuickReplyButton(action=MessageAction(label="🗑️清空", text="清空")),
-        QuickReplyButton(action=MessageAction(label="📌已選", text="已選")),
-        QuickReplyButton(action=MessageAction(label="❓幫助", text="幫助")),
-    ])
-
-    return QuickReply(items=items)
+# ---------------------
+# 推薦演算法
+# ---------------------
+def score_fn(overlap, missing, total):
+    return len(overlap) * 10 - len(missing) + (len(overlap) / total) * 200
 
 
-def recipe_to_bubble(recipe: Dict[str, Any], rank: int) -> Dict[str, Any]:
-    """
-    產生 Flex bubble
-    """
-    name = str(recipe.get("name", f"料理{rank}"))
-    time_min = recipe.get("time_min", "?")
-    ingredients = recipe.get("ingredients", [])
-    tips = recipe.get("tips", "")
+def recommend(user_ings_raw, topk=5, allow_missing=True, max_missing=8, min_overlap=1):
+    user_ings = {norm(w) for w in user_ings_raw if norm(w)}
+    if not user_ings:
+        return []
 
-    if isinstance(ingredients, list):
-        ing_preview = "\n".join([f"• {x}" for x in ingredients[:6]])
-        if len(ingredients) > 6:
-            ing_preview += "\n• ..."
-    else:
-        ing_preview = str(ingredients)
+    cand_idx = set().union(*(inv_index.get(i, set()) for i in user_ings))
+    scored = []
+    for idx in cand_idx:
+        rec = recipes[idx]
+        overlap = user_ings & rec["norm_ings"]
+        if len(overlap) < min_overlap:
+            continue
+        missing = rec["norm_ings"] - user_ings
+        if (not allow_missing and missing) or len(missing) > max_missing:
+            continue
+        score = score_fn(overlap, missing, len(rec["norm_ings"]) or 1)
+        scored.append((score, overlap, missing, rec))
 
-    body_contents = [
-        {
-            "type": "text",
-            "text": f"{rank}. {name}",
-            "weight": "bold",
-            "size": "lg",
-            "wrap": True
-        },
-        {
-            "type": "text",
-            "text": f"⏱ 約 {time_min} 分鐘",
-            "size": "sm",
-            "margin": "md",
-            "wrap": True
-        },
-        {
-            "type": "text",
-            "text": "🧺 食材（部分）",
-            "size": "sm",
-            "margin": "md",
-            "weight": "bold"
-        },
-        {
-            "type": "text",
-            "text": ing_preview or "（未提供）",
-            "size": "sm",
-            "wrap": True,
-            "margin": "sm"
-        }
-    ]
+    scored.sort(key=lambda x: (-x[0], len(x[2]), x[3].get("name", "")))
+    return scored[:topk]
 
-    if tips:
-        body_contents.append({
-            "type": "text",
-            "text": f"💡 {tips}",
-            "size": "sm",
-            "wrap": True,
-            "margin": "md"
-        })
 
-    bubble = {
+def recipe_to_bubble(rank, overlap, missing, recipe):
+    have = "、".join(sorted(overlap)) or "—"
+    lack = "、".join(sorted(missing)) or "—"
+    return {
         "type": "bubble",
+        "size": "mega",
         "body": {
             "type": "box",
             "layout": "vertical",
-            "contents": body_contents
+            "spacing": "md",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"{rank}. {recipe.get('name','(未命名)')}",
+                    "wrap": True,
+                    "weight": "bold",
+                    "size": "lg",
+                    "margin": "none",
+                },
+                {
+                    "type": "text",
+                    "text": f"⭕ 🈶：{have}",
+                    "wrap": True,
+                    "size": "sm",
+                    "margin": "md",
+                },
+                {
+                    "type": "text",
+                    "text": f"❌ 🈚：{lack}",
+                    "wrap": True,
+                    "size": "sm",
+                },
+            ],
         },
         "footer": {
             "type": "box",
             "layout": "vertical",
-            "spacing": "sm",
             "contents": [
                 {
                     "type": "button",
                     "style": "primary",
+                    "color": "#1DB446",
                     "action": {
                         "type": "message",
-                        "label": "看做法",
-                        "text": f"做法 {rank}"
-                    }
+                        "label": f"看做法({rank})",
+                        "text": f"做法 {rank}",
+                    },
                 }
-            ]
-        }
+            ],
+        },
     }
-    return bubble
 
 
-def build_recipe_carousel(recipes: List[Dict[str, Any]]) -> FlexSendMessage:
-    bubbles = [recipe_to_bubble(r, i + 1) for i, r in enumerate(recipes[:10])]
-    return FlexSendMessage(
+# ---------------------
+# 使用者冰箱（記憶：目前存在記憶體，重啟會清空）
+# ---------------------
+user_fridge = defaultdict(set)  # user_id -> set(norm ingredient)
+recent_rec = {}  # user_id -> list[recipe]
+
+
+def fridge_list_text(user_id: str) -> str:
+    ings = sorted(user_fridge[user_id])
+    return "你的冰箱目前：" + ("、".join(ings) if ings else "（空的）")
+
+
+def add_to_fridge(user_id: str, ings):
+    for w in ings:
+        nw = norm(w)
+        if nw:
+            user_fridge[user_id].add(nw)
+
+
+def clear_fridge(user_id: str):
+    user_fridge[user_id].clear()
+
+
+# ---------------------
+# Quick Reply（按鈕選食材）
+# ---------------------
+def make_quickreply_menu():
+    """最多 13 個 quick reply actions；留 1~2 個做系統按鈕。"""
+    items = []
+
+    # 常見食材：點一下就加入（取前 10 個避免超過限制）
+    for ing in COMMON_INGS[:10]:
+        items.append(QuickReplyButton(action=MessageAction(label=f"+{ing}", text=f"加入 {ing}")))
+
+    # 系統按鈕
+    items.append(QuickReplyButton(action=MessageAction(label="🍳 推薦", text="推薦")))
+    items.append(QuickReplyButton(action=MessageAction(label="📦 查看冰箱", text="查看冰箱")))
+    items.append(QuickReplyButton(action=MessageAction(label="🗑 清空", text="清空冰箱")))
+
+    return QuickReply(items=items)
+
+
+# ---------------------
+# 推薦流程
+# ---------------------
+def recommend_and_build_messages(user_id: str, ing_set, topk=5):
+    """用 ing_set 推薦，回傳 (TextSendMessage, FlexSendMessage or None, bubbles_count)"""
+    if not ing_set:
+        return (
+            TextSendMessage(
+                text="我沒有偵測到可用食材喔～你可以用『選食材』按鈕加入，或再描述一次。",
+                quick_reply=make_quickreply_menu(),
+            ),
+            None,
+            0,
+        )
+
+    recs = recommend(ing_set, topk=topk, allow_missing=True, max_missing=10)
+    if not recs:
+        return (
+            TextSendMessage(
+                text=f"資料庫找不到適合「{'、'.join(sorted(ing_set))}」的食譜 😢\n你可以再加一些食材或換組合試試。",
+                quick_reply=make_quickreply_menu(),
+            ),
+            None,
+            0,
+        )
+
+    bubbles = [
+        recipe_to_bubble(rank=i, overlap=ov, missing=miss, recipe=r)
+        for i, (_, ov, miss, r) in enumerate(recs, 1)
+    ]
+
+    # 存給「做法 N」用
+    recent_rec[user_id] = [r for _, _, _, r in recs]
+
+    text_msg = TextSendMessage(
+        text=(
+            f"偵測/使用的食材：{'、'.join(sorted(ing_set))}\n"
+            f"{fridge_list_text(user_id)}\n\n"
+            "輸入『做法 + 編號』可看完整步驟；或用按鈕繼續加食材再推薦。"
+        ),
+        quick_reply=make_quickreply_menu(),
+    )
+
+    flex_msg = FlexSendMessage(
         alt_text="推薦料理",
-        contents={
-            "type": "carousel",
-            "contents": bubbles
-        }
+        contents={"type": "carousel", "contents": bubbles},
     )
 
-
-def help_text() -> str:
-    return (
-        "🍳 冰箱食譜小幫手\n\n"
-        "指令：\n"
-        "1) 選食材：開始用按鈕選食材\n"
-        "2) +食材：手動加入（例：+雞蛋）\n"
-        "3) 已選：查看目前已選食材\n"
-        "4) 清空：清掉已選食材\n"
-        "5) 完成：用 Gemini 依食材推薦食譜\n"
-        "6) 做法 N：查看第 N 道料理步驟\n"
-    )
+    return text_msg, flex_msg, len(bubbles)
 
 
-# =========================================================
-# 5) Flask webhook
-# =========================================================
-
+# ---------------------
+# Flask
+# ---------------------
 app = Flask(__name__)
+
 
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-
     return "OK"
 
 
-# =========================================================
-# 6) LINE Events
-# =========================================================
-
 @handler.add(FollowEvent)
-def on_follow(event):
-    user_id = event.source.user_id
-    user_page[user_id] = 0
+def handle_follow(event: FollowEvent):
+    welcome = (
+        "嗨～我是冰箱清理小幫手！\n\n"
+        "✅ 你可以直接輸入一句話：\n"
+        "例如：『我家有 牛胸肉 雞肉 洋蔥 花椰菜』\n\n"
+        "✅ 或輸入『選食材』用按鈕加入食材\n"
+        "✅ 輸入『推薦』用你冰箱裡的食材推薦料理\n"
+        "✅ 輸入『查看冰箱』『清空冰箱』管理食材\n"
+        "（看做法：輸入『做法 1』）"
+    )
     line_api.reply_message(
         event.reply_token,
-        TextSendMessage("嗨！輸入「選食材」開始用按鈕選食材～\n也可輸入「幫助」看指令。")
+        TextSendMessage(text=welcome, quick_reply=make_quickreply_menu()),
     )
 
 
 @handler.add(MessageEvent, message=TextMessage)
-def on_message(event):
+def handle_text(event):
     user_id = event.source.user_id
     text = (event.message.text or "").strip()
 
-    # --- 幫助 ---
-    if text in ["幫助", "help", "?"]:
-        line_api.reply_message(event.reply_token, TextSendMessage(help_text()))
-        return
-
-    # --- 開始選食材 ---
-    if text in ["選食材", "開始", "開始選食材"]:
-        user_page[user_id] = 0
-        line_api.reply_message(
-            event.reply_token,
-            TextSendMessage("請點選你冰箱有的食材（可一直點）", quick_reply=build_ing_quick_reply(user_id))
-        )
-        return
-
-    # --- 更多（翻頁） ---
-    if text == "更多":
-        user_page[user_id] += 1
-        line_api.reply_message(
-            event.reply_token,
-            TextSendMessage("更多食材在這～", quick_reply=build_ing_quick_reply(user_id))
-        )
-        return
-
-    # --- 已選 ---
-    if text == "已選":
-        now = "、".join(sorted(user_selected[user_id])) or "（尚未選）"
-        line_api.reply_message(
-            event.reply_token,
-            TextSendMessage(f"📌目前已選：{now}", quick_reply=build_ing_quick_reply(user_id))
-        )
-        return
-
-    # --- 清空 ---
-    if text == "清空":
-        user_selected[user_id].clear()
-        user_last_recipes.pop(user_id, None)
-        line_api.reply_message(
-            event.reply_token,
-            TextSendMessage("🗑️已清空！重新選食材吧～", quick_reply=build_ing_quick_reply(user_id))
-        )
-        return
-
-    # --- 點按鈕加入食材：+xxx ---
-    if text.startswith("+"):
-        ing = text[1:].strip()
-        if ing:
-            user_selected[user_id].add(ing)
-        now = "、".join(sorted(user_selected[user_id])) or "（尚未選）"
-        line_api.reply_message(
-            event.reply_token,
-            TextSendMessage(f"✅已加入：{ing}\n目前已選：{now}", quick_reply=build_ing_quick_reply(user_id))
-        )
-        return
-
-    # --- 做法 N ---
+    # ---------- 看做法 ----------
     if text.startswith("做法"):
         m = re.search(r"\d+", text)
-        if not m:
-            line_api.reply_message(event.reply_token, TextSendMessage("請輸入：做法 1 / 做法 2 ..."))
-            return
-
-        idx = int(m.group()) - 1
-        recipes = user_last_recipes.get(user_id, [])
-        if not recipes or idx < 0 or idx >= len(recipes):
-            line_api.reply_message(event.reply_token, TextSendMessage("找不到這道料理～請先「完成」查食譜。"))
-            return
-
-        recipe = recipes[idx]
-        steps = recipe.get("steps", [])
-        if isinstance(steps, list):
-            steps_text = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
-        else:
-            steps_text = str(steps)
-
+        if m and user_id in recent_rec:
+            idx = int(m.group()) - 1
+            if 0 <= idx < len(recent_rec[user_id]):
+                recipe = recent_rec[user_id][idx]
+                line_api.reply_message(
+                    event.reply_token,
+                    TextSendMessage(
+                        f"《{recipe.get('name','(未命名)')}》\n\n"
+                        + recipe.get("instructions", "（沒有步驟內容）")
+                    ),
+                )
+                return
         line_api.reply_message(
             event.reply_token,
-            TextSendMessage(f"《{recipe.get('name','料理')}》\n\n{steps_text or '（未提供步驟）'}")
+            TextSendMessage("找不到對應的編號耶～先輸入食材讓我推薦一次，再輸入『做法 1』喔。"),
         )
         return
 
-    # --- 完成：呼叫 Gemini ---
-    if text == "完成":
-        ings = sorted(user_selected[user_id])
-        if not ings:
-            line_api.reply_message(
-                event.reply_token,
-                TextSendMessage("你還沒選食材喔～先輸入「選食材」", quick_reply=build_ing_quick_reply(user_id))
-            )
-            return
-
-        try:
-            recipes = gemini_recipe_search(ings, topk=5)
-            user_last_recipes[user_id] = recipes
-
-            # 先回一則文字 + 再回 Flex（同一個 reply_token 可一次回多則）
-            selected_text = "、".join(ings)
-            msg1 = TextSendMessage(f"🍽️你選的食材：{selected_text}\n我幫你找到了 {len(recipes)} 道料理：")
-            msg2 = build_recipe_carousel(recipes)
-
-            line_api.reply_message(event.reply_token, [msg1, msg2])
-
-        except Exception as e:
-            line_api.reply_message(event.reply_token, TextSendMessage(f"❌查詢失敗：{e}"))
+    # ---------- 管理冰箱 ----------
+    if text in {"查看冰箱", "冰箱", "我的冰箱"}:
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=fridge_list_text(user_id), quick_reply=make_quickreply_menu()),
+        )
         return
 
-    # --- 其他輸入：提示 ---
+    if text in {"清空冰箱", "清空", "重置冰箱"}:
+        clear_fridge(user_id)
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="已清空～\n" + fridge_list_text(user_id), quick_reply=make_quickreply_menu()),
+        )
+        return
+
+    # ---------- 按鈕選食材 ----------
+    if text in {"選食材", "新增食材", "加食材", "按鈕", "menu", "MENU"}:
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="你可以點按鈕快速加入食材（也可以直接打字：『加入 牛胸肉』）。",
+                quick_reply=make_quickreply_menu(),
+            ),
+        )
+        return
+
+    # ---------- 手動加入（文字） ----------
+    m_add = re.match(r"^(?:加入|加|新增)[:：\s]+(.+)$", text)
+    if m_add:
+        raw = m_add.group(1)
+
+        parts = re.split(r"[\s、,，;；/]+", raw)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        _, ing_set = extract_ingredients(raw)
+        if ing_set:
+            add_to_fridge(user_id, ing_set)
+            added = sorted({norm(i) for i in ing_set if norm(i)})
+        else:
+            add_to_fridge(user_id, parts)
+            added = sorted({norm(i) for i in parts if norm(i)})
+
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=f"已加入：{'、'.join(added) if added else '（未偵測到）'}\n{fridge_list_text(user_id)}",
+                quick_reply=make_quickreply_menu(),
+            ),
+        )
+        return
+
+    # ---------- 用冰箱推薦 ----------
+    if text in {"推薦", "推薦料理", "煮什麼", "做什麼", "想煮"}:
+        ing_set = set(user_fridge[user_id])
+        text_msg, flex_msg, _ = recommend_and_build_messages(user_id, ing_set, topk=5)
+        msgs = [text_msg] + ([flex_msg] if flex_msg else [])
+        line_api.reply_message(event.reply_token, msgs)
+        return
+
+    # ---------- 一般句子：自動抓食材 + 推薦 ----------
+    # ✅ 修正：永遠合併 extract_ingredients + fallback_split，避免漏抓「我家有 雞肉」
+    _, ing_set_model = extract_ingredients(text)
+    ing_set_split = fallback_split(text)
+
+    ing_set = set(ing_set_model) | set(ing_set_split)
+    ing_set = {x for x in ing_set if x}
+
+    if ing_set:
+        add_to_fridge(user_id, ing_set)
+        use_set = set(user_fridge[user_id])
+        text_msg, flex_msg, _ = recommend_and_build_messages(user_id, use_set, topk=5)
+        msgs = [text_msg] + ([flex_msg] if flex_msg else [])
+        line_api.reply_message(event.reply_token, msgs)
+        return
+
+    # 沒抓到：提示用法
     line_api.reply_message(
         event.reply_token,
-        TextSendMessage("輸入「選食材」開始，或輸入「幫助」看指令。")
+        TextSendMessage(
+            text=(
+                "我沒有在這句話裡偵測到食材耶～\n"
+                "你可以：\n"
+                "1) 直接輸入：『我家有 牛胸肉 雞肉 洋蔥 花椰菜』\n"
+                "2) 輸入『選食材』用按鈕加入\n"
+                "3) 或輸入：『加入 牛胸肉』"
+            ),
+            quick_reply=make_quickreply_menu(),
+        ),
     )
 
 
-# =========================================================
-# 7) main
-# =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
