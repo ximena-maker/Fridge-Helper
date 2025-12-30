@@ -31,11 +31,12 @@ from google.genai import types
 # 冰箱清理小幫手（LINE Bot）- 全部用 Google Gemini + Imagen
 #
 # ✅ 任何食材/部位/品項都能輸入（例如：霜降牛小排、雞腿排、松阪豬、干貝、金針菇…）
-# ✅ 我家有 xxx / 隨便一句話：Gemini 抽食材（盡量保留原本寫法）+ 產生至少 3 道食譜
-# ✅ + 或 開啟按鈕選單：叫出 Quick Reply
-# ✅ - 或 用完食材：開啟移除選單；也可直接輸入 - 食材1 食材2
-# ✅ 每道菜 1 張示意圖（Imagen）
-# ✅ 做法 N：每一步 1 張示意圖 + 翻頁
+# ✅ 直接打食材：只加入冰箱（不自動推薦）
+# ✅ 推薦：才用 Gemini 生成至少 3 道食譜（每道 1 張示意圖）
+# ✅ 做法 N：每一步 1 張示意圖（Imagen）+ 翻頁
+# ✅ ? / help / 幫助：叫出選單 + 使用方法
+# ✅ + 食材 / - 食材：才會加/減食材（+ 或 - 單獨仍是叫出選單）
+# ✅ 非食材內容：跳出選單 + 使用方法
 #
 # 必要環境變數（Render / 本機）：
 # - CHANNEL_SECRET
@@ -289,6 +290,83 @@ def heuristic_extract_ingredients(text: str) -> List[str]:
 
 
 # =========================================================
+# Help / 判斷是否像食材輸入
+# =========================================================
+HELP_TRIGGERS = {"?", "help", "幫助", "說明"}
+
+
+def reply_help(reply_token: str):
+    msg = (
+        "📌 冰箱清理小幫手使用方法\n\n"
+        "✅ 加入食材（擇一）：\n"
+        "1) 直接打食材：雞腿排 洋蔥\n"
+        "2) 我家有/冰箱有：我家有 霜降牛小排 洋蔥\n"
+        "3) 用 + 加：+ 雞腿排 洋蔥\n\n"
+        "✅ 移除食材：\n"
+        "- 雞腿排 洋蔥\n"
+        "（或輸入「-」叫出移除選單）\n\n"
+        "✅ 生成 3 道食譜：輸入「推薦」\n"
+        "✅ 不喜歡：輸入「換食譜」（同一批食材換 3 道）\n"
+        "✅ 看做法：做法 1 / 做法 2 / 做法 3\n"
+        "✅ 步驟翻頁：下一頁 / 上一頁\n\n"
+        "👉 叫出選單：輸入 ? / help / 幫助（或輸入 +）"
+    )
+    line_api.reply_message(reply_token, TextSendMessage(text=msg, quick_reply=make_quickreply_menu()))
+
+
+def looks_like_ingredients_text(text: str) -> bool:
+    """
+    粗略判斷這句話像不像「食材輸入」。
+    目的：避免使用者打一般聊天內容時，跑去叫 Gemini。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # 指令類直接不算
+    cmd_words = {
+        "推薦", "換食譜", "下一頁", "上一頁", "查看冰箱", "清空冰箱",
+        "+", "-", "開啟按鈕選單", "按鈕選單", "選單", "menu", "MENU"
+    }
+    if t in cmd_words:
+        return False
+
+    # 問句/聊天常見字：偏向「非食材」
+    bad_phrases = ["怎麼", "為什麼", "可以嗎", "要不要", "幫我", "教我", "哪裡", "多少", "什麼", "是不是", "哈", "哈哈", "呵", "早安", "晚安"]
+    if any(p in t for p in bad_phrases):
+        return False
+
+    # 只要包含「我家有/冰箱有/剩下」→ 幾乎一定是食材
+    if re.search(r"(我家有|冰箱裡有|冰箱有|我剩下|剩下)\s*", t):
+        return True
+
+    # 明確 + 食材 或 - 食材
+    if re.match(r"^[\+\-]\s*\S+", t):
+        return True
+
+    # 做法 N 不算食材
+    if re.match(r"^(做法)\s*\d+\s*$", t):
+        return False
+
+    # 拆分後若像一串短詞（常見輸入格式），視為食材
+    parts = [p.strip() for p in re.split(SEPS, t) if p.strip()]
+    if not parts:
+        return False
+
+    # 避免網址/亂碼
+    if re.search(r"https?://|www\.", t):
+        return False
+
+    only_cjk = all(re.search(r"[\u4e00-\u9fff]", p) for p in parts)
+    short_enough = len("".join(parts)) <= 30 and all(len(p) <= 12 for p in parts)
+
+    if (len(parts) >= 2 and short_enough) or (len(parts) == 1 and only_cjk and len(parts[0]) <= 10):
+        return True
+
+    return False
+
+
+# =========================================================
 # Quick Reply（按鈕）
 # =========================================================
 COMMON_INGS = ["雞肉", "牛肉", "豬肉", "雞蛋", "洋蔥", "大蒜", "蔥"]  # 只做快捷，不限制輸入
@@ -296,9 +374,11 @@ COMMON_INGS = ["雞肉", "牛肉", "豬肉", "雞蛋", "洋蔥", "大蒜", "蔥"
 
 def make_quickreply_menu() -> QuickReply:
     items = []
+    # 6 個食材快捷（改成 + 食材）
     for ing in COMMON_INGS[:6]:
-        items.append(QuickReplyButton(action=MessageAction(label=f"+{ing}", text=f"加入 {ing}")))
+        items.append(QuickReplyButton(action=MessageAction(label=f"+{ing}", text=f"+ {ing}")))
 
+    # 功能
     items.append(QuickReplyButton(action=MessageAction(label="🍳 推薦", text="推薦")))
     items.append(QuickReplyButton(action=MessageAction(label="🔁 換食譜", text="換食譜")))
     items.append(QuickReplyButton(action=MessageAction(label="➖ 用完", text="-")))
@@ -306,6 +386,7 @@ def make_quickreply_menu() -> QuickReply:
     items.append(QuickReplyButton(action=MessageAction(label="下一頁 ➡", text="下一頁")))
     items.append(QuickReplyButton(action=MessageAction(label="📦 查看冰箱", text="查看冰箱")))
     items.append(QuickReplyButton(action=MessageAction(label="🗑 清空", text="清空冰箱")))
+    items.append(QuickReplyButton(action=MessageAction(label="❓ 幫助", text="幫助")))
     return QuickReply(items=items)
 
 
@@ -321,7 +402,8 @@ def make_remove_quickreply(user_id: str) -> QuickReply:
     items.append(QuickReplyButton(action=MessageAction(label="🍳 推薦", text="推薦")))
     items.append(QuickReplyButton(action=MessageAction(label="🔁 換食譜", text="換食譜")))
     items.append(QuickReplyButton(action=MessageAction(label="📦 查看冰箱", text="查看冰箱")))
-    items.append(QuickReplyButton(action=MessageAction(label="➕ 按鈕選單", text="+")))
+    items.append(QuickReplyButton(action=MessageAction(label="➕ 選單", text="+")))
+    items.append(QuickReplyButton(action=MessageAction(label="❓ 幫助", text="幫助")))
     return QuickReply(items=items)
 
 
@@ -590,7 +672,7 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
                 line_api.reply_message(
                     reply_token,
                     TextSendMessage(
-                        text="你還沒有可用食材～先輸入：『我家有 霜降牛小排 洋蔥』或用『加入 雞腿排』加入吧！",
+                        text="你還沒有可用食材～先輸入：『雞腿排 洋蔥』或用『+ 雞腿排』加入吧！",
                         quick_reply=make_quickreply_menu(),
                     ),
                 )
@@ -615,11 +697,6 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
         extracted = [str(x).strip() for x in extracted if str(x).strip()]
         if extracted:
             add_to_fridge(user_id, extracted)
-        else:
-            # 如果 Gemini 沒回 ingredients，就用保底拆詞把「疑似食材」加進去
-            fallback = heuristic_extract_ingredients(user_text)
-            if fallback:
-                add_to_fridge(user_id, fallback)
 
         use_ings = fridge_list(user_id)
         last_used_ings[user_id] = use_ings
@@ -660,13 +737,13 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
 
         text_msg = TextSendMessage(
             text=(
-                f"✅ 使用/記錄食材：{'、'.join(use_ings) if use_ings else '（未偵測到）'}\n"
+                f"✅ 目前食材：{'、'.join(use_ings) if use_ings else '（空）'}\n"
                 f"{fridge_text(user_id)}\n\n"
                 "我給你 3 個選項～\n"
-                "📌 看做法（含步驟圖）：輸入『做法 1/2/3』\n"
-                "🔁 不喜歡：輸入/按『換食譜』再換一批\n"
-                "➖ 用完食材：輸入『- 雞腿排』或直接輸入『-』叫出移除選單\n"
-                "➕ 叫出按鈕：輸入『+』或『開啟按鈕選單』"
+                "📌 看做法（含步驟圖）：輸入『做法 1/2/3』或點卡片按鈕\n"
+                "🔁 不喜歡：按『換食譜』再換一批\n"
+                "➖ 用完食材：輸入『- 雞腿排』或輸入『-』叫出移除選單\n"
+                "➕ 叫出選單：輸入『? / help / 幫助』或『+』"
             ),
             quick_reply=make_quickreply_menu(),
         )
@@ -683,8 +760,8 @@ def reply_recipes(user_id: str, reply_token: str, user_text: str, force_same_ing
                 text=(
                     f"Google 生成時出錯：{type(e).__name__}: {e}\n\n"
                     "你可以試：\n"
-                    "1) 我家有 霜降牛小排 洋蔥\n"
-                    "2) 加入 雞腿排 洋蔥\n"
+                    "1) 直接輸入食材：霜降牛小排 洋蔥\n"
+                    "2) 用 + 加：+ 雞腿排 洋蔥\n"
                     "3) 推薦\n\n"
                     "（若看到 API key leaked/403：請換新的 GEMINI_API_KEY，並更新 Render 環境變數）"
                 ),
@@ -700,7 +777,7 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
     if user_id not in recent_recipes:
         line_api.reply_message(
             reply_token,
-            TextSendMessage(text="你還沒有推薦清單～先輸入食材或『推薦』。", quick_reply=make_quickreply_menu()),
+            TextSendMessage(text="你還沒有推薦清單～先輸入食材並按『推薦』。", quick_reply=make_quickreply_menu()),
         )
         return
 
@@ -728,7 +805,7 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
         step_items = [{"text": t, "image_url": u} for t, u in zip(cache["steps"], cache["img_urls"])]
 
         header = TextSendMessage(
-            text=f"《{recipe_name}》步驟示意圖（第 1 頁）\n輸入『下一頁/上一頁』翻頁。",
+            text=f"《{recipe_name}》步驟示意圖（第 1 頁）\n輸入『下一頁/上一頁』翻頁，或按『換食譜』換一批。",
             quick_reply=make_quickreply_menu(),
         )
         flex = steps_to_flex(step_items, page=0, page_size=5)
@@ -785,7 +862,7 @@ def reply_steps_with_images(user_id: str, reply_token: str, recipe_idx: int):
         text=(
             f"《{recipe_name}》步驟示意圖（第 1 頁）\n"
             f"（我先幫你把前 {len(step_items)} 步做成圖）\n"
-            "輸入『下一頁/上一頁』翻頁。"
+            "輸入『下一頁/上一頁』翻頁，或按『換食譜』換一批。"
         ),
         quick_reply=make_quickreply_menu(),
     )
@@ -813,7 +890,7 @@ def reply_step_page(user_id: str, reply_token: str, delta: int):
 
     flex = steps_to_flex(step_items, page=new_page, page_size=page_size)
     msg = TextSendMessage(
-        text=f"《{cache.get('recipe_name','料理')}》步驟示意圖（第 {new_page+1} 頁）",
+        text=f"《{cache.get('recipe_name','料理')}》步驟示意圖（第 {new_page+1} 頁）\n（可按『換食譜』換一批）",
         quick_reply=make_quickreply_menu(),
     )
     line_api.reply_message(reply_token, [msg, flex])
@@ -850,14 +927,14 @@ def callback():
 def handle_follow(event: FollowEvent):
     welcome = (
         "嗨～我是冰箱清理小幫手（Google 版）！\n\n"
-        "✅ 你可以輸入任何食材/部位：\n"
-        "例如：『我家有 霜降牛小排 雞腿排 洋蔥』\n\n"
-        "✅ 或輸入『加入 雞腿排』存進冰箱\n"
-        "✅ 輸入『推薦』生成 3 道菜\n"
-        "✅ 不喜歡按『換食譜』\n"
-        "✅ 看做法（含步驟圖）：輸入『做法 1』\n"
+        "✅ 先把食材加進冰箱：\n"
+        "・直接打：雞腿排 洋蔥\n"
+        "・或用：+ 雞腿排 洋蔥\n\n"
+        "✅ 要食譜：輸入『推薦』(我會給 3 道)\n"
+        "✅ 不喜歡：按『換食譜』\n"
+        "✅ 看做法：輸入『做法 1』\n"
         "✅ 用完食材：輸入『- 雞腿排』或輸入『-』叫出移除選單\n"
-        "✅ 叫出按鈕：輸入『+』或『開啟按鈕選單』"
+        "✅ 需要選單/說明：輸入『? / help / 幫助』或『+』"
     )
     line_api.reply_message(event.reply_token, TextSendMessage(text=welcome, quick_reply=make_quickreply_menu()))
 
@@ -866,6 +943,11 @@ def handle_follow(event: FollowEvent):
 def handle_text(event: MessageEvent):
     user_id = event.source.user_id
     text = (event.message.text or "").strip()
+
+    # ---------- help ----------
+    if text.lower() in HELP_TRIGGERS or text in HELP_TRIGGERS:
+        reply_help(event.reply_token)
+        return
 
     # ---------- 開啟按鈕選單 ----------
     if text in {"+", "開啟按鈕選單", "按鈕選單", "選單", "menu", "MENU"}:
@@ -878,7 +960,7 @@ def handle_text(event: MessageEvent):
         )
         return
 
-    # ---------- 用完食材：- 移除 ----------
+    # ---------- 用完食材：-（單獨輸入）叫出移除選單 ----------
     if text in {"-", "用完食材", "移除食材", "刪食材", "減食材"}:
         if not fridge_list(user_id):
             line_api.reply_message(
@@ -895,6 +977,23 @@ def handle_text(event: MessageEvent):
         )
         return
 
+    # ---------- + 食材：加入 ----------
+    m_plus = re.match(r"^\+\s*(.+)$", text)  # 支援 +雞腿排 / + 雞腿排 洋蔥
+    if m_plus:
+        raw = m_plus.group(1).strip()
+        parts = [p.strip() for p in re.split(SEPS, raw) if p.strip()]
+        if not parts:
+            line_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入：+ 雞腿排 洋蔥（可一次加入多個）", quick_reply=make_quickreply_menu()),
+            )
+            return
+        added = add_to_fridge(user_id, parts)
+        msg = f"✅ 已加入：{'、'.join(added)}\n{fridge_text(user_id)}" if added else f"這些已經在冰箱裡了～\n{fridge_text(user_id)}"
+        line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=make_quickreply_menu()))
+        return
+
+    # ---------- - 食材：移除 ----------
     m_minus = re.match(r"^-\s*(.+)$", text)  # 支援 -雞腿排 / - 雞腿排 洋蔥
     if m_minus:
         raw = m_minus.group(1).strip()
@@ -902,10 +1001,7 @@ def handle_text(event: MessageEvent):
         if not parts:
             line_api.reply_message(
                 event.reply_token,
-                TextSendMessage(
-                    text="請輸入：- 雞腿排 洋蔥（可一次移除多個）",
-                    quick_reply=make_remove_quickreply(user_id),
-                ),
+                TextSendMessage(text="請輸入：- 雞腿排 洋蔥（可一次移除多個）", quick_reply=make_remove_quickreply(user_id)),
             )
             return
         removed = remove_from_fridge(user_id, parts)
@@ -930,36 +1026,21 @@ def handle_text(event: MessageEvent):
         reply_step_page(user_id, event.reply_token, delta=-1)
         return
 
-    # ---------- 查看冰箱 ----------
+    # ---------- 查看/清空 ----------
     if text in {"查看冰箱", "冰箱", "我的冰箱"}:
         line_api.reply_message(event.reply_token, TextSendMessage(text=fridge_text(user_id), quick_reply=make_quickreply_menu()))
         return
 
-    # ---------- 清空冰箱（✅修掉你原本換行造成的 SyntaxError） ----------
     if text in {"清空冰箱", "清空", "重置冰箱", "清空全部"}:
         clear_fridge(user_id)
         recent_recipes.pop(user_id, None)
         last_used_ings.pop(user_id, None)
         last_titles.pop(user_id, None)
         step_view_state.pop(user_id, None)
-
         line_api.reply_message(
             event.reply_token,
             TextSendMessage(text="🗑 已清空冰箱！\n你的冰箱目前：（空的）", quick_reply=make_quickreply_menu()),
         )
-        return
-
-    # ---------- 加入食材：支援「加入 xxx」或「加 xxx」 ----------
-    m_add = re.match(r"^(加入|加)\s*(.+)$", text)
-    if m_add:
-        raw = (m_add.group(2) or "").strip()
-        parts = [p.strip() for p in re.split(SEPS, raw) if p.strip()]
-        if not parts:
-            line_api.reply_message(event.reply_token, TextSendMessage(text="請輸入：加入 雞腿排 洋蔥", quick_reply=make_quickreply_menu()))
-            return
-        added = add_to_fridge(user_id, parts)
-        msg = f"✅ 已加入：{'、'.join(added)}\n{fridge_text(user_id)}" if added else f"這些已經在冰箱裡了～\n{fridge_text(user_id)}"
-        line_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=make_quickreply_menu()))
         return
 
     # ---------- 做法 N ----------
@@ -970,6 +1051,7 @@ def handle_text(event: MessageEvent):
         return
 
     # ---------- 換食譜 / 推薦 ----------
+    # 看作法後也可用 quick reply 按「換食譜」
     if text in {"換食譜", "換", "重新推薦", "再推薦"}:
         reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=True)
         return
@@ -978,8 +1060,32 @@ def handle_text(event: MessageEvent):
         reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=False)
         return
 
-    # ---------- 其他任何輸入：一律當作「你想用這句話來推薦」 ----------
-    reply_recipes(user_id, event.reply_token, user_text=text, force_same_ingredients=False)
+    # =========================================================
+    # ✅ 你要的核心行為：
+    # - 直接打「食材」→ 只加入冰箱（不自動推薦）
+    # - 打「非食材內容」→ 跳出選單 + 使用方法
+    # =========================================================
+    if looks_like_ingredients_text(text):
+        parts = heuristic_extract_ingredients(text)
+        parts = [p.strip() for p in parts if p.strip()]
+        if not parts:
+            reply_help(event.reply_token)
+            return
+
+        added = add_to_fridge(user_id, parts)
+        if added:
+            msg = f"✅ 已加入冰箱：{'、'.join(added)}\n{fridge_text(user_id)}\n\n接著輸入「推薦」我會給你 3 道菜～"
+        else:
+            msg = f"這些食材可能已經在冰箱裡了～\n{fridge_text(user_id)}\n\n輸入「推薦」我會給你 3 道菜～"
+
+        line_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=msg, quick_reply=make_quickreply_menu()),
+        )
+        return
+
+    # ---------- 非食材 / 非食物內容：跳 help + 選單 ----------
+    reply_help(event.reply_token)
 
 
 if __name__ == "__main__":
